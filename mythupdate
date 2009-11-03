@@ -1,0 +1,18 @@
+#!/bin/bash
+
+cd /opt/tv_grab_tvguide
+
+export DEBUG=1
+
+rm -f cablemas.xmltv
+rm -f airedigital.xmltv
+rm -f aireanalogo.xmltv
+
+./tv_grab_tvguide cablemas.conf    1>log/cablemas.tv_grab_tvguide.`date '+%Y%m%d'`.log    2>&1
+./tv_grab_tvguide airedigital.conf 1>log/airedigital.tv_grab_tvguide.`date '+%Y%m%d'`.log 2>&1
+./tv_grab_tvguide aireanalogo.conf 1>log/aireanalogo.tv_grab_tvguide.`date '+%Y%m%d'`.log 2>&1
+
+mythfilldatabase --file 1 cablemas.xmltv    1>log/cablemas.mythfilldatabase.`date '+%Y%m%d'`.log    2>&1
+mythfilldatabase --file 2 airedigital.xmltv 1>log/airedigital.mythfilldatabase.`date '+%Y%m%d'`.log 2>&1
+mythfilldatabase --file 3 aireanalogo.xmltv 1>log/aireanalogo.mythfilldatabase.`date '+%Y%m%d'`.log 2>&1
+

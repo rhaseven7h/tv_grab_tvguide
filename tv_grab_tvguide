@@ -1,0 +1,227 @@
+#!/usr/local/bin/ruby
+
+require 'rubygems'
+require 'open-uri'
+require 'yaml'
+require 'time'
+require 'pp'
+require 'utilisima'
+
+ROOT_PATH=File.dirname(__FILE__)
+FETCH_MINS=10080
+
+def log(str_text, use_puts=true)
+  if ENV['DEBUG']
+    if use_puts
+      STDERR.puts str_text if ENV["DEBUG"]
+    else
+      STDERR.print str_text if ENV["DEBUG"]
+    end
+    STDERR.flush
+  end
+end
+
+def fetch_listings(service_id)
+  str_file = File.join(ROOT_PATH, 'cache', 'listings', "#{service_id.to_s}_#{Time.now.strftime("%Y%m%d")}.listing")
+  log "FETCH: #{str_file}"
+  str_url = "http://www.tvguide.com/listings/data/ajaxdata.ashx?gridyr=#{Time.now.year}&gridmo=#{Time.now.month}&griddy=#{Time.now.day}&gridhr=0&gridmins=#{FETCH_MINS}&srvid=#{service_id}"
+  log "FETCH: #{str_url}"
+  if not File.exist?(str_file)
+    log "FETCH: No cache, fetching from remote."
+    File.open(str_file, 'w') do |f_out|
+      open(str_url) do |f_in|
+        f_out.write f_in.read
+      end
+    end
+  else
+    log "FETCH: Local cache available, retrieving."
+  end
+  return File.open(str_file).read
+end
+
+def category_id2str(category_id)
+  case category_id
+    when "1"    : "series"
+    when "2"    : "tvshow"
+    when "64"   : "movie"
+    when "256"  : "news"
+    when "1024" : "sports"
+    else ""
+  end
+end
+
+def tvguide_offset(line)
+  l=line.split(' ')
+  s1=l[1].strip
+  s2=l[4].strip
+  st1=s1[0..3]+s1[5..6]+s1[8..9]+s1[11..12]+s1[14..15]
+  st2=s2[0..3]+s2[5..6]+s2[8..9]+s2[11..12]+s2[14..15]
+  t1=Time.parse(st1)
+  t2=Time.parse(st2)
+  d=((t1-t2) / 60).to_i
+  ds=sprintf('%-03i%02i', (d / 60), (d % 60))
+  return ds
+end
+
+def tvguide_times(start, offset, length, str_xmltv_id, adjustments)
+  f=Time.parse(start+' '+offset)
+  fo = f.gmt_offset / 60
+  fos = sprintf("%-03i%02i", (fo / 60), (fo % 60))
+  
+  t=Time.parse(start+' '+offset)+(length.to_i*60)
+  to = t.gmt_offset / 60
+  tos = sprintf("%-03i%02i", (to / 60), (to % 60))
+  
+  if adjustments
+    if adjustments[str_xmltv_id.to_sym]
+      f = f + adjustments[str_xmltv_id.to_sym] * 60
+      t = t + adjustments[str_xmltv_id.to_sym] * 60
+    end
+  end
+  
+  sf='%Y%m%d%H%M'
+  return [ f.strftime(sf)+' '+fos, t.strftime(sf)+' '+tos ]
+end
+
+def parse_listings(str_listing, str_subdomain, selected_channels, adjustments)
+  data = {}
+  log "PARSER: Starting."
+  bol_first = true
+  programmes = []
+  channels = []
+  str_offset = 'UNASSIGNED'
+  selected_channels = selected_channels.map{|i|i.strip.upcase} if selected_channels.class == Array
+  str_listing.each_line do |line|
+    if bol_first
+      bol_first = false
+      str_offset = tvguide_offset(line)
+    else
+      fields = line.split("\t").map(&:strip)
+      str_xmltv_id = fields[ 1].strip.upcase+'.'+fields[2].gsub(/[^0-9A-Z]/i,'-').strip.upcase+'.'+str_subdomain.strip.downcase
+      if (selected_channels && selected_channels.include?(str_xmltv_id.strip.upcase)) or selected_channels.nil?
+        times = tvguide_times(fields[14], str_offset, fields[15], str_xmltv_id, adjustments)
+        programmes << { 
+          :number       => fields[ 1],
+          :xmltv_id     => str_xmltv_id,
+          :start        => times[0],
+          :stop         => times[1],
+          :length       => fields[15],
+          :title        => "<![CDATA[#{fields[4]}]]>",
+          :category     => category_id2str(fields[6]),
+          :programme_id => fields[12],
+          :callsign     => "<![CDATA[#{fields[2]}]]>",
+          :offset       => str_offset.strip
+        }
+        channels << {
+          :number       => fields[ 1],
+          :xmltv_id     => str_xmltv_id,
+          :callsign     => "<![CDATA[#{fields[2]}]]>"
+        }
+      end
+    end
+  end
+  log "PARSER: Finished."
+  return { :channels => channels.uniq, :programmes => programmes }
+end
+
+def fetch_description_and_category(programme_id)
+  desc_path = File.join(ROOT_PATH, 'cache', 'descriptions', programme_id+'.desc')
+  str_desc = ''
+  str_cate = ''
+  if File.exists?(desc_path)
+    str = File.open(desc_path).read
+    parts = str.split("\t")
+    str_desc = parts[3]
+    str_cate = parts[10]
+  else
+    log "Programme fetching details #{programme_id} from remote"
+    open("http://www.tvguide.com/listings/data/ajaxdetail.ashx?Qr=#{programme_id}&flags=C&tvoid=0") do |f_in|
+      File.open(desc_path, 'w') do |f_out|
+        str = f_in.read
+        parts = str.split("\t")
+        str_desc = parts[3]
+        str_cate = parts[10]
+        f_out.write(str)
+      end
+    end
+  end
+  { :description => str_desc, :category => str_cate }
+end
+
+def channels_xml(channels, str_domain)
+  str_out = ""
+  int_size = channels.size
+  int_count = 0
+  channels.each do |channel|
+    str_out += %Q(\t<channel id="#{channel[:xmltv_id]+"."+str_domain.strip.downcase}">\n)
+    str_out += %Q(\t\t<display-name>#{channel[:callsign]}</display-name>\n)
+    str_out += %Q(\t\t<display-name>#{channel[:callsign]} - #{str_domain}</display-name>\n)
+    str_out += %Q(\t\t<display-name>#{channel[:callsign]} - #{str_domain}</display-name>\n)
+    str_out += %Q(\t</channel>\n)
+    int_count += 1
+    log "Channel #{int_count}/#{int_size}"
+  end
+  str_out
+end
+
+def programmes_xml(programmes, str_domain)
+  str_out = ""
+  int_size = programmes.size
+  int_count = 0
+  programmes.each do |programme|
+    dac = fetch_description_and_category(programme[:programme_id])
+    str_out += %Q(\t<programme channel="#{programme[:xmltv_id]+"."+str_domain.strip.downcase}" start="#{programme[:start]}" stop="#{programme[:stop]}">\n)
+    str_out += %Q(\t\t<title>#{programme[:title]}</title>\n)
+    str_out += %Q(\t\t<desc>#{(dac[:description].to_s.size > 0) ? dac[:description] : programme[:title] }</desc>\t\n)
+    str_out += %Q(\t\t<category>#{dac[:category]}</category>\t\n)
+    str_out += %Q(\t</programme>\n)
+    int_count += 1
+    log "Programme #{int_count}/#{int_size}"
+  end
+  str_out
+end
+
+def generate_xml(data, str_domain)
+  str_out  = ""
+  str_out += %Q(<tv generator-info-name="tv_grab_tvguide">\n)
+  str_out += channels_xml(data[:channels], str_domain)
+  str_out += programmes_xml(data[:programmes], str_domain) 
+  str_out += %Q(</tv>\n)
+  str_out
+end
+
+if ARGV.size != 1
+  puts "You must specify a single parameter which would be a configuration file path."
+  exit
+end
+
+conf_file=ARGV[0].strip
+config=YAML.load(File.open(conf_file))
+
+data = { :channels => [], :programmes => [] }
+
+config[:services].each do |service|
+  service_data = parse_listings(fetch_listings(service[:service_id]), service[:service_name], config[:channels], config[:adjustments])
+  if service[:service_name] = 'cmj'
+    if service[:channels]
+      if service[:channels].include?('67.UTIL.cmj')
+        service_data[:programmes] = service_data[:programmes].select{|i| i[:xmltv_id] != '67.UTIL.cmj' }
+      end
+    else
+      service_data[:programmes] = service_data[:programmes].select{|i| i[:xmltv_id] != '67.UTIL.cmj' }
+    end
+    u = XMLTVUtilisima.new
+    service_data[:programmes] = [service_data[:programmes], u.fetch ].flatten 
+  end
+  data[:channels  ].concat(service_data[:channels  ])
+  data[:programmes].concat(service_data[:programmes])
+end
+
+File.open("#{conf_file.gsub(/.conf$/i,'')}.xmltv", 'w') do |o1|
+  File.open("generations/#{conf_file.gsub(/.conf$/i,'')}.#{Time.now.strftime('%Y%m%d')}.xmltv", 'w') do |o2|
+    data = generate_xml(data, config[:source])
+    o1.write(data) 
+    o2.write(data) 
+  end
+end
+
